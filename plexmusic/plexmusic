@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Play music from a Plex server on the local Bluetooth speaker.
+
+Run as the `muse` user. Reads PLEX_URL and PLEX_TOKEN from /home/muse/plex.env.
+Playback runs in a detached mpv process controlled over a JSON IPC socket.
+"""
+import argparse
+import json
+import os
+import random
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+ENV_FILE = os.environ.get("PLEXMUSIC_ENV", "/home/muse/plex.env")
+SPEAKER_MAC = os.environ.get("PLEXMUSIC_SPEAKER", "98:52:3D:C5:42:44")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+os.environ["XDG_RUNTIME_DIR"] = RUNTIME  # lets mpv find this user's PulseAudio
+SOCKET = os.path.join(RUNTIME, "plexmusic.sock")
+PLAYLIST = os.path.join(RUNTIME, "plexmusic.m3u")
+MAX_TRACKS = 500
+
+
+def load_env(path):
+    values = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, val = line.partition("=")
+                values[key.strip()] = val.strip().strip('"').strip("'")
+    return values
+
+
+ENV = load_env(ENV_FILE)
+PLEX_URL = ENV["PLEX_URL"].rstrip("/")
+PLEX_TOKEN = ENV["PLEX_TOKEN"]
+
+
+def plex_get(path):
+    sep = "&" if "?" in path else "?"
+    url = f"{PLEX_URL}{path}{sep}X-Plex-Token={urllib.parse.quote(PLEX_TOKEN)}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.load(resp)["MediaContainer"]
+
+
+def music_sections():
+    sections = plex_get("/library/sections").get("Directory", [])
+    return [s for s in sections if s.get("type") == "artist"]
+
+
+def track_from(meta):
+    media_key = meta.get("Media", [{}])[0].get("Part", [{}])[0].get("key") or meta["key"]
+    return {
+        "title": meta.get("title", "Unknown"),
+        "artist": meta.get("grandparentTitle") or meta.get("originalTitle") or "Unknown Artist",
+        "album": meta.get("parentTitle") or "Unknown Album",
+        "media_key": media_key,
+    }
+
+
+def list_genres():
+    genres = set()
+    for section in music_sections():
+        for g in plex_get(f"/library/sections/{section['key']}/genre").get("Directory", []):
+            genres.add(g["title"].lower())
+    return sorted(genres)
+
+
+def tracks_by_genre(genre):
+    tracks = []
+    for section in music_sections():
+        q = urllib.parse.quote(genre)
+        for meta in plex_get(f"/library/sections/{section['key']}/all?type=10&genre={q}").get("Metadata", []):
+            tracks.append(track_from(meta))
+    return tracks
+
+
+def tracks_by_album(album, artist=None):
+    tracks = []
+    for section in music_sections():
+        q = urllib.parse.quote(album)
+        for alb in plex_get(f"/library/sections/{section['key']}/all?type=9&title={q}").get("Metadata", []):
+            if artist and artist.lower() not in (alb.get("parentTitle") or "").lower():
+                continue
+            for meta in plex_get(alb["key"]).get("Metadata", []):
+                tracks.append(track_from(meta))
+    return tracks
+
+
+def ensure_speaker():
+    """Connect the Bluetooth speaker if it is not already connected."""
+    def connected():
+        out = subprocess.run(["bluetoothctl", "info", SPEAKER_MAC], capture_output=True, text=True).stdout
+        return "Connected: yes" in out
+
+    if connected():
+        return
+    for _ in range(3):  # the speaker can be slow to wake after idling
+        try:
+            subprocess.run(["bluetoothctl", "connect", SPEAKER_MAC], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(1)
+        if connected():
+            time.sleep(2)  # let PulseAudio create the sink
+            return
+    sys.exit("Speaker is not connected. Turn on the JBL Charge 4 and try again.")
+
+
+def mpv_command(*command):
+    """Send one command to the running mpv; returns its reply or None if not running."""
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(3)
+            s.connect(SOCKET)
+            s.sendall((json.dumps({"command": list(command)}) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            for line in buf.splitlines():
+                reply = json.loads(line)
+                if "error" in reply:
+                    return reply
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout):
+        return None
+    return None
+
+
+def stop_player():
+    mpv_command("quit")
+    for path in (SOCKET, PLAYLIST):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def start_player(tracks):
+    stop_player()
+    ensure_speaker()
+    fd = os.open(PLAYLIST, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("#EXTM3U\n")
+        for t in tracks:
+            url = f"{PLEX_URL}{t['media_key']}?X-Plex-Token={urllib.parse.quote(PLEX_TOKEN)}"
+            f.write(f"#EXTINF:-1,{t['artist']} - {t['title']} ({t['album']})\n{url}\n")
+    subprocess.Popen(
+        ["mpv", "--no-video", "--no-terminal", "--idle=no", f"--input-ipc-server={SOCKET}",
+         f"--playlist={PLAYLIST}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    for _ in range(20):
+        if os.path.exists(SOCKET):
+            break
+        time.sleep(0.25)
+
+
+def running():
+    reply = mpv_command("get_property", "pid")
+    return reply is not None and reply.get("error") == "success"
+
+
+def cmd_genres(_args):
+    print("\n".join(list_genres()))
+
+
+def cmd_play_genre(args):
+    tracks = tracks_by_genre(args.genre)
+    if not tracks:
+        sys.exit(f"No tracks found for genre '{args.genre}'. Run `plexmusic genres` to see valid names.")
+    if not args.no_shuffle:
+        random.shuffle(tracks)
+    tracks = tracks[:MAX_TRACKS]
+    start_player(tracks)
+    print(f"Playing {len(tracks)} tracks from '{args.genre}'. First: {tracks[0]['artist']} - {tracks[0]['title']}")
+
+
+def cmd_play_album(args):
+    tracks = tracks_by_album(args.album, args.artist)
+    if not tracks:
+        sys.exit(f"No album matching '{args.album}' found.")
+    start_player(tracks)
+    print(f"Playing {len(tracks)} tracks. First: {tracks[0]['artist']} - {tracks[0]['title']}")
+
+
+def cmd_now_playing(_args):
+    if not running():
+        print("Nothing is playing.")
+        return
+    title = (mpv_command("get_property", "media-title") or {}).get("data")
+    pos = (mpv_command("get_property", "playlist-pos-1") or {}).get("data")
+    count = (mpv_command("get_property", "playlist-count") or {}).get("data")
+    print(f"{title} (track {pos} of {count})")
+
+
+def cmd_playlist(args):
+    if not running():
+        print("Nothing is playing.")
+        return
+    items = (mpv_command("get_property", "playlist") or {}).get("data", [])
+    current = next((i for i, item in enumerate(items) if item.get("current")), 0)
+    for i, item in enumerate(items[current:current + args.limit], start=current + 1):
+        marker = ">" if i == current + 1 else " "
+        print(f"{marker} {i}. {item.get('title') or item.get('filename', '').split('?')[0]}")
+
+
+def cmd_skip(_args):
+    if not running():
+        sys.exit("Nothing is playing.")
+    mpv_command("playlist-next")
+    time.sleep(0.5)
+    cmd_now_playing(_args)
+
+
+def cmd_stop(_args):
+    stop_player()
+    print("Stopped.")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="plexmusic", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("genres", help="list genres").set_defaults(fn=cmd_genres)
+    p = sub.add_parser("play-genre", help="play a genre")
+    p.add_argument("genre")
+    p.add_argument("--no-shuffle", action="store_true")
+    p.set_defaults(fn=cmd_play_genre)
+    p = sub.add_parser("play-album", help="play an album")
+    p.add_argument("album")
+    p.add_argument("--artist")
+    p.set_defaults(fn=cmd_play_album)
+    sub.add_parser("now-playing", help="show the current track").set_defaults(fn=cmd_now_playing)
+    p = sub.add_parser("playlist", help="show the upcoming queue")
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(fn=cmd_playlist)
+    sub.add_parser("skip", help="next track").set_defaults(fn=cmd_skip)
+    sub.add_parser("stop", help="stop playback").set_defaults(fn=cmd_stop)
+    args = parser.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
